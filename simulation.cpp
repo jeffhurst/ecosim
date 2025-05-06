@@ -13,33 +13,40 @@
 constexpr float PI = 3.14159265358979323846f; // π constant
 
 // world dimensions
-constexpr int WIDTH  = 200;
-constexpr int HEIGHT = 200;
+constexpr int WIDTH  = 100;
+constexpr int HEIGHT = 100;
 
 // simulation parameters
 constexpr int MAX_TICKS        = 10000;
 constexpr int DAY_LENGTH       = 100;    // ticks per day at equinox
 constexpr int SEASON_LENGTH    = 4 * DAY_LENGTH; // 4 seasons cycle
-constexpr int SAVE_INTERVAL    = 100;     // ticks between serialization
+constexpr int SAVE_INTERVAL    = 10;     // ticks between serialization
 constexpr float INITIAL_GRASS_PROB = 0.02f; // 2% chance per tile
 
 // mutation strength
 constexpr float MUTATION_STDDEV = 0.05f;
 
 // rain parameters
-constexpr int   RAIN_INTERVAL = 500; // every 500 ticks
+constexpr int   RAIN_INTERVAL = 50; // every 500 ticks
 constexpr float RAIN_AMOUNT   = 1.0f; // water units per soil tile
 
 // nutrient uptake thresholds
-constexpr float REPRODUCE_ENERGY = 3.0f;
-constexpr int   MATURITY_AGE     = 20;
+constexpr float REPRODUCE_ENERGY = 0.55f;
+constexpr int   MATURITY_AGE_SCALE     = 0.3;
+
+// occupancy grid
+static std::vector<bool> occupied(WIDTH * HEIGHT, false);
+inline bool isOccupied(int x, int y)   { return occupied[y * WIDTH + x]; }
+inline void setOccupied(int x, int y)  { occupied[y * WIDTH + x] = true; }
+inline void clearOccupied(int x, int y){ occupied[y * WIDTH + x] = false; }
+
 
 // --- Tile grid for abiotic components ---
 enum class TileType { Soil, Water };
 struct Tile {
     TileType type = TileType::Soil; // default to soil
-    float    water = 5.0f;   // initial water amout
-    float    nutrient = 5.0f; // initial soil nutrient
+    float    water = 10.0f;   // initial water amout
+    float    nutrient = 5000.0f; // initial soil nutrient
 };
 static std::vector<Tile> grid;
 inline Tile& at(int x, int y) { return grid[y * WIDTH + x]; }
@@ -57,12 +64,17 @@ struct Energy { float value = 0.0f; };
 
 // counters
 typedef unsigned long long ull;
-static ull energyDeaths = 0, waterDeaths = 0, oldAgeDeaths = 0, grassAlive = 0;
+static ull energyDeaths = 0,
+            waterDeaths = 0,
+           oldAgeDeaths = 0, 
+             grassAlive = 0;
+float avgGrassEnergy = 0.0;
 
 // random utilities
 std::mt19937_64 rng{12345};
 std::normal_distribution<float>   gauss(0.0f, MUTATION_STDDEV);
 std::uniform_real_distribution<>  uni(0.0f,1.0f);
+
 
 // —— Helper: generate circular lake + branching rivers ——
 void generateWorld(unsigned seed=12345) {
@@ -98,7 +110,10 @@ void generateWorld(unsigned seed=12345) {
 // —— Plant initial grass randomly across soil tiles ——
 void seedGrass(entt::registry &reg) {
     for(int y=0;y<HEIGHT;y++)for(int x=0;x<WIDTH;x++){
-        if(at(x,y).type==TileType::Soil && uni(rng) < INITIAL_GRASS_PROB) {
+        int agePlus = int((gauss(rng)*10.0+0.5));       // how much to add to new max age
+        if(at(x,y).type==TileType::Soil 
+                && !isOccupied(x,y) 
+                && uni(rng) < INITIAL_GRASS_PROB) {
             auto e = reg.create();                   // create grass entity
             reg.emplace<Position>(e, x,y);           // add position component
             Genes g;
@@ -107,8 +122,11 @@ void seedGrass(entt::registry &reg) {
             g.nutrientEff = 1.0f + gauss(rng);
             g.decayRate   = 0.5f + gauss(rng)*0.1f;
             reg.emplace<Genes>(e, g);
-            reg.emplace<Age>(e, Age{0, 50 + int(gauss(rng)*10)});
-            reg.emplace<Energy>(e, Energy{5.0f});
+            
+            reg.emplace<Age>(e, Age{0, 50 + agePlus});
+            reg.emplace<Energy>(e, Energy{0.5f});
+
+            setOccupied(x,y);
             grassAlive++; 
         }
     }
@@ -134,7 +152,7 @@ struct Serializer {
 
         stats_out.open(stats_fn);
         stats_out << "# summary stats per save\n";
-        stats_out << "tick,totalEntities,energyDeaths,waterDeaths,oldAgeDeaths\n";
+        stats_out << "tick,totalEntities,energyDeaths,waterDeaths,oldAgeDeaths,avgGrassEnergy\n";
     }
 
     void save(int tick, int grassAlive,  entt::registry &reg) {
@@ -162,9 +180,10 @@ struct Serializer {
                   << grassAlive << ','
                   << energyDeaths << ','
                   << waterDeaths  << ','
-                  << oldAgeDeaths << '\n';
-        // reset death counters
-        //energyDeaths = waterDeaths = oldAgeDeaths = 0;
+                  << oldAgeDeaths  << ','
+                  << avgGrassEnergy << '\n';
+        // reset counters
+        energyDeaths = waterDeaths = oldAgeDeaths = avgGrassEnergy = 0;
     }
 };
 
@@ -208,27 +227,40 @@ void soilUptake(entt::registry &reg){
 
 void growAndAge(entt::registry &reg){
     std::vector<entt::entity> to_kill;
+    float sum = 0.0f;
+    int count = 0;
     reg.view<Position,Age,Energy>().each(
         [&](auto id, auto &pos, auto &age, auto &en){
+            count++;
+            sum += en.value;
             age.age++;
-            if(en.value <= 0.0f) {
-                // classify death cause
-                Tile &t = at(pos.x,pos.y);
-                if(t.water <= 0.0f) {
-                    waterDeaths++; }
-                else { energyDeaths++; }
+            // classify death cause
+            Tile &t = at(pos.x,pos.y);
+            if (t.water <= 0.0f) {
+                waterDeaths++;
                 // return a bit of nutrient
                 t.nutrient += std::max(en.value, 0.5f);
                 to_kill.push_back(id);
-            }
-            else if(age.age >= age.maxAge) {
+            } else if (en.value <= 0.2f) {
+                energyDeaths++;
+                // return a bit of nutrient
+                t.nutrient += std::max(en.value, 1.0f);
+                to_kill.push_back(id);     
+            } else if(age.age >= age.maxAge) {
                 oldAgeDeaths++;
                 Tile &t = at(pos.x,pos.y);
-                t.nutrient += std::max(en.value, 0.5f);
+                t.nutrient += std::max(en.value, 1.0f);
                 to_kill.push_back(id);
             }
         });
+    if (count != 0) {
+        avgGrassEnergy = ( sum / count );
+    } else {
+        avgGrassEnergy = 0.0f;
+    }
     for(auto e: to_kill) {
+        Position pos = reg.get<Position>(e);
+        clearOccupied(pos.x, pos.y);
         reg.destroy(e);
         grassAlive--;
     }
@@ -243,11 +275,16 @@ void reproduce(entt::registry &reg){
             Energy&              en,
             Genes&               g)
       {
-        if(age.age >= MATURITY_AGE && en.value >= REPRODUCE_ENERGY){
+        if(age.age >= MATURITY_AGE_SCALE*age.maxAge && en.value >= REPRODUCE_ENERGY){
           // find random neighbor
           int dx = int(uni(rng)*3)-1, dy = int(uni(rng)*3)-1;
           int nx = pos.x+dx, ny = pos.y+dy;
-          if(nx>=0 && nx<WIDTH && ny>=0 && ny<HEIGHT && at(nx,ny).type==TileType::Soil){
+          if(  nx>=0 
+               && nx<WIDTH 
+               && ny>=0 
+               && ny<HEIGHT 
+               && at(nx,ny).type==TileType::Soil
+               && !isOccupied(nx,ny) ){
             // mutate genes
             Genes ng = g;
             ng.sunlightEff += gauss(rng);
@@ -255,19 +292,20 @@ void reproduce(entt::registry &reg){
             ng.nutrientEff += gauss(rng);
             ng.decayRate   += gauss(rng)*0.02f;
             births.emplace_back(Position{nx,ny}, ng, int(age.maxAge));
-            en.value *= 0.5f; // share energy
+            en.value *= 0.1f; // share energy
+            setOccupied(nx,ny);
           }
         }
       });
     for(auto &b: births){
-      auto e = reg.create();
-      reg.emplace<Position>(e, std::get<0>(b));
-      reg.emplace<Genes>(e, std::get<1>(b));
-      // offspring age=0, inherit parent's maxAge with slight variance
-      int parentMax = std::get<2>(b);
-      reg.emplace<Age>(e, Age{0, std::max(10, int(parentMax + gauss(rng)*5))});
-      reg.emplace<Energy>(e, Energy{5.0f});
-      grassAlive++;
+        auto e = reg.create();
+        reg.emplace<Position>(e, std::get<0>(b));
+        reg.emplace<Genes>(e, std::get<1>(b));
+        // offspring age=0, inherit parent's maxAge with slight variance
+        int parentMax = std::get<2>(b);
+        reg.emplace<Age>(e, Age{0, std::max(10, int(parentMax + gauss(rng)*10+0.1))});
+        reg.emplace<Energy>(e, Energy{0.5f});
+        grassAlive++;     
     }
 }
 
@@ -296,7 +334,10 @@ int main(){
       }
       rainSystem(tick);
 
-      if(tick % SAVE_INTERVAL == 0) ser.save(tick, grassAlive, reg);
+      if(tick % SAVE_INTERVAL == 0) {
+        ser.save(tick, grassAlive, reg);
+        std::cout << tick << "\n";
+      }
     }
 
      std::cout<<"Simulation complete. Data -> grass_states.csv, world_states.csv, simulation_stats.csv\n";
