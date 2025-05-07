@@ -74,20 +74,20 @@ int main() {
         return 1;
     }
     std::getline(worldFile, line); // skip header
-    std::vector<std::vector<Vec2i>> waterFrames(NUM_FRAMES);
+    std::vector<std::tuple<int,int>> waterFrames(NUM_FRAMES);
     while (std::getline(worldFile, line)) {
         if (line.empty()) continue;
         std::stringstream ss(line);
         std::string tok;
-        int tick, x, y;
-        std::getline(ss, tok, ','); tick = std::stoi(trim(tok));
+        int x, y;
         std::getline(ss, tok, ','); x    = std::stoi(trim(tok));
         std::getline(ss, tok, ','); y    = std::stoi(trim(tok));
         std::getline(ss, tok, ','); // type string
         std::string type = trim(tok);
-        int idx = tick / SAVE_INTERVAL;
-        if (idx >= 0 && idx < NUM_FRAMES && type == "Water")
-            waterFrames[idx].push_back({x, y});
+        
+        if ( type == "Water"){
+            waterFrames.push_back({x, y});
+        }
     }
     worldFile.close();
 
@@ -138,8 +138,8 @@ int main() {
         BeginDrawing();
           ClearBackground(BLACK);
           float drawScale = SCALE * zoom;
-          for (auto &p : waterFrames[frame]) {
-            DrawRectangle(int(p.x * drawScale), int(p.y * drawScale),
+          for (auto &p : waterFrames) {
+            DrawRectangle(int(std::get<0>(p) * drawScale), int(std::get<1>(p) * drawScale),
                           int(drawScale), int(drawScale), BLUE);
           }
           for (auto &p : grassFrames[frame]) {
